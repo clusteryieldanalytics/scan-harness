@@ -1,0 +1,15 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+.metals
+.bloop
+
+# PySpark lint pipeline (generated, reproducible)
+corpus-pyspark/
+lint-results/
+lint-report/
+
+# OS
+.DS_Store
+Thumbs.db
