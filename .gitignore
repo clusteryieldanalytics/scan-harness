@@ -9,6 +9,7 @@
 corpus-pyspark/
 lint-results/
 lint-report/
+metadata/
 
 # OS
 .DS_Store

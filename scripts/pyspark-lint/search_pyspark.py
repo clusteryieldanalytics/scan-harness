@@ -35,7 +35,10 @@ except ImportError:
 # GitHub API Search
 # ─────────────────────────────────────────────────────────────
 
-SEARCH_QUERIES = [
+# GitHub Code Search returns max 1000 results per query, so we use
+# multiple search terms to maximize corpus coverage.
+
+_BASE_QUERIES = [
     # PySpark imports and session creation
     '"from pyspark" language:python',
     '"SparkSession" language:python',
@@ -44,10 +47,31 @@ SEARCH_QUERIES = [
     # DataFrame chain patterns
     '".groupBy(" "pyspark" language:python',
     '".join(" "pyspark" language:python',
+    # Additional patterns for broader coverage
+    '"pyspark.sql.types" language:python',
+    '"spark.read" "pyspark" language:python',
+    '".toPandas()" "pyspark" language:python',
+    '"spark.createDataFrame" language:python',
 ]
+
+SEARCH_QUERIES = _BASE_QUERIES
 
 GITHUB_API_BASE = "https://api.github.com"
 SEARCH_ENDPOINT = f"{GITHUB_API_BASE}/search/code"
+REPO_SEARCH_ENDPOINT = f"{GITHUB_API_BASE}/search/repositories"
+
+# Queries for repository search (used with --min-stars to target mature repos).
+# These use GitHub's repository search which supports stars:/forks: qualifiers.
+_REPO_QUERIES = [
+    "pyspark language:python",
+    "spark etl language:python",
+    "spark pipeline language:python",
+    "spark data language:python",
+    "pyspark topic:pyspark",
+    "pyspark topic:spark",
+    "pyspark topic:etl",
+    "pyspark topic:data-engineering",
+]
 
 
 def search_github(
@@ -116,6 +140,70 @@ def search_github(
     return results[:max_results]
 
 
+def search_github_repos(
+    query: str,
+    token: Optional[str] = None,
+    min_stars: int = 50,
+    max_results: int = 1000,
+) -> list[dict]:
+    """
+    Search GitHub repository API for repos matching the query with star filter.
+    Returns a list of {repo_full_name, repo_clone_url, file_path, file_url}.
+    """
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    full_query = f"{query} stars:>={min_stars}"
+    results = []
+    page = 1
+    per_page = 100
+
+    while len(results) < max_results:
+        params = {
+            "q": full_query,
+            "per_page": per_page,
+            "page": page,
+            "sort": "stars",
+            "order": "desc",
+        }
+
+        resp = requests.get(REPO_SEARCH_ENDPOINT, headers=headers, params=params)
+
+        if resp.status_code == 403:
+            reset_time = int(resp.headers.get("X-RateLimit-Reset", 0))
+            wait = max(reset_time - int(time.time()), 10)
+            print(f"  Rate limited. Waiting {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code != 200:
+            print(f"  GitHub API error {resp.status_code}: {resp.text[:200]}")
+            break
+
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for item in items:
+            full_name = item.get("full_name", "")
+            results.append({
+                "repo_full_name": full_name,
+                "repo_clone_url": f"https://github.com/{full_name}.git",
+                "file_path": "",
+                "file_html_url": item.get("html_url", ""),
+            })
+
+        page += 1
+        time.sleep(2 if token else 6)
+
+        if page > 10:
+            break
+
+    return results[:max_results]
+
+
 def deduplicate_repos(results: list[dict]) -> dict[str, dict]:
     """
     Deduplicate by repo, collecting all matching file paths per repo.
@@ -174,16 +262,29 @@ def find_pyspark_files(repo_dir: Path) -> list[Path]:
         "pyspark.sql",
     ]
 
+    skip_dirs = [
+        "/test/", "/tests/", "/testing/",
+        "/test_", "/_test",
+        "/spec/", "/specs/",
+        "/fixtures/", "/testdata/", "/test-data/", "/test_data/",
+        "/mock/", "/mocks/",
+        "/examples/", "/example/", "/samples/", "/sample/",
+        "/demo/", "/demos/",
+        "/benchmark/", "/benchmarks/",
+        "/venv/", "/.venv/", "/site-packages/",
+        "/node_modules/", "/.tox/", "/.nox/",
+        "/docs/", "/doc/",
+    ]
+    skip_names = {"setup.py", "conftest.py", "conf.py", "noxfile.py", "fabfile.py"}
+
     candidates = []
     for py_file in repo_dir.rglob("*.py"):
-        # Skip test files
-        if "/test/" in str(py_file) or "/tests/" in str(py_file):
+        rel = str(py_file.relative_to(repo_dir))
+        if any(skip in f"/{rel}" for skip in skip_dirs):
             continue
-        # Skip setup/config files
-        if py_file.name in ("setup.py", "conftest.py", "conf.py"):
+        if py_file.name in skip_names:
             continue
-        # Skip virtual environments
-        if "/venv/" in str(py_file) or "/.venv/" in str(py_file) or "/site-packages/" in str(py_file):
+        if py_file.name.startswith(("test_", "tests_")) or py_file.name.endswith(("_test.py", "_tests.py", "_spec.py")):
             continue
 
         try:
@@ -232,6 +333,20 @@ def main():
         "--max-clone-failures", type=int, default=3,
         help="Abort after this many consecutive clone failures (default: 3)"
     )
+    parser.add_argument(
+        "--min-stars", type=int, default=0,
+        help="Use repository search (not code search) to find repos with at least this many stars. "
+             "Targets Tier 3/4 repos. (default: 0 = use code search)"
+    )
+    parser.add_argument(
+        "--lint-results-dir", type=Path, default=None,
+        help="Skip cloning repos that already have a lint result file in this directory"
+    )
+    parser.add_argument(
+        "--cleanup", action="store_true",
+        help="Delete cloned repos that already have lint results (requires --lint-results-dir). "
+             "Frees disk space while preserving lint data."
+    )
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
@@ -253,23 +368,57 @@ def main():
             print("Error: --skip-search specified but no search-results.json found")
             sys.exit(1)
     else:
+        search_mode = "repo" if args.min_stars > 0 else "code"
         print("═══════════════════════════════════════════════════════")
         print("  PySpark GitHub Scraper — Searching for PySpark code")
         print("═══════════════════════════════════════════════════════")
         print(f"  Token: {'provided' if args.token else 'none (rate limits will be tight)'}")
+        print(f"  Search mode: {search_mode}"
+              + (f" (stars >= {args.min_stars})" if search_mode == "repo" else ""))
         print()
 
+        # Load existing search results to merge with (accumulate across runs)
+        existing_repos = {}
+        if search_results_path.exists():
+            try:
+                with open(search_results_path) as f:
+                    existing_repos = json.load(f)
+                print(f"  Loaded {len(existing_repos)} existing repos to merge with")
+            except (json.JSONDecodeError, OSError):
+                pass
+
         all_results = []
-        for query in SEARCH_QUERIES:
-            print(f"  Searching: {query[:60]}...")
-            results = search_github(query, token=args.token, max_results=200)
-            print(f"    Found {len(results)} results")
-            all_results.extend(results)
+        if search_mode == "repo":
+            for query in _REPO_QUERIES:
+                print(f"  Searching repos: {query} stars:>={args.min_stars} ...")
+                results = search_github_repos(
+                    query, token=args.token, min_stars=args.min_stars, max_results=1000
+                )
+                print(f"    Found {len(results)} repos")
+                all_results.extend(results)
+        else:
+            for query in SEARCH_QUERIES:
+                print(f"  Searching: {query[:60]}...")
+                results = search_github(query, token=args.token, max_results=1000)
+                print(f"    Found {len(results)} results")
+                all_results.extend(results)
 
-        repos = deduplicate_repos(all_results)
-        print(f"\n  Unique repos: {len(repos)}")
+        new_repos = deduplicate_repos(all_results)
 
-        # Save search results
+        # Merge: existing repos keep their data, new repos are added
+        for name, info in new_repos.items():
+            if name not in existing_repos:
+                existing_repos[name] = info
+            else:
+                # Merge file lists (deduplicate)
+                existing_files = set(existing_repos[name].get("files", []))
+                existing_files.update(info.get("files", []))
+                existing_repos[name]["files"] = list(existing_files)
+
+        repos = existing_repos
+        print(f"\n  Unique repos (after merge): {len(repos)}")
+
+        # Save merged search results
         with open(search_results_path, "w") as f:
             json.dump(repos, f, indent=2)
         print(f"  Saved search results to {search_results_path}")
@@ -278,32 +427,77 @@ def main():
         print("\n  --skip-clone specified, stopping here.")
         return
 
+    # Build set of already-linted repos (to skip cloning)
+    linted_repos: set[str] = set()
+    if args.lint_results_dir:
+        lint_dir = args.lint_results_dir.resolve()
+        if lint_dir.exists():
+            for f in lint_dir.glob("*.json"):
+                # owner__repo.json -> owner/repo
+                linted_repos.add(f.stem.replace("__", "/", 1))
+            print(f"  Found {len(linted_repos)} already-linted repos")
+
+    # Cleanup mode: delete cloned repos that have lint results
+    if args.cleanup:
+        if not linted_repos:
+            print("Error: --cleanup requires --lint-results-dir with existing results")
+            sys.exit(1)
+
+        import shutil
+        cleaned = 0
+        freed = 0
+        for repo_name in linted_repos:
+            repo_dir = clone_dir / repo_name.replace("/", "__")
+            if repo_dir.exists():
+                # Estimate size before deleting
+                size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
+                shutil.rmtree(repo_dir)
+                cleaned += 1
+                freed += size
+        print(f"\n  Cleanup: deleted {cleaned} repos, freed {freed / (1024**2):.0f} MB")
+        if not args.skip_search:
+            print("  Continuing with clone step...")
+        else:
+            return
+
     # Step 2: Clone repos and find PySpark candidates
-    print(f"\n── Cloning repos (max {args.max_repos}) ──")
+    # --max-repos limits NEW clones only; already-cached repos are always processed
+    print(f"\n── Cloning repos (max {args.max_repos} new clones, {len(repos)} total) ──")
 
     total_pyspark_files = 0
     repos_with_pyspark = 0
     processed = 0
+    new_clones = 0
     clone_failures = 0
     consecutive_failures = 0
     max_consecutive = args.max_clone_failures
+    skipped_linted = 0
 
     # Track per-repo PySpark file counts for summary
     repo_summary = {}
 
-    for repo_name, repo_info in list(repos.items())[:args.max_repos]:
+    for repo_name, repo_info in repos.items():
         processed += 1
         repo_dir = clone_dir / repo_name.replace("/", "__")
-        label = f"[{processed}/{min(len(repos), args.max_repos)}]"
+        label = f"[{processed}/{len(repos)}]"
 
         if repo_dir.exists():
             print(f"  {label} {repo_name} (cached)")
             consecutive_failures = 0
+        elif repo_name in linted_repos:
+            # Already linted, clone was deleted — skip
+            skipped_linted += 1
+            continue
         else:
+            # Check if we've hit the new-clone budget
+            if args.max_repos > 0 and new_clones >= args.max_repos:
+                continue
+
             print(f"  {label} {repo_name} ... ", end="", flush=True)
             success, error = clone_repo(repo_info["clone_url"], repo_dir)
             if success:
                 print("ok")
+                new_clones += 1
                 consecutive_failures = 0
             else:
                 clone_failures += 1
@@ -327,18 +521,30 @@ def main():
                 "pyspark_files": [str(f.relative_to(repo_dir)) for f in pyspark_files],
             }
 
-    # Save repo summary (used by run_lint.sh to know which repos to lint)
+    # Merge with existing repo summary (accumulate across runs)
     summary_path = output_dir / "repo-summary.json"
+    if summary_path.exists():
+        try:
+            with open(summary_path) as f:
+                existing_summary = json.load(f)
+            # Keep existing entries, add/update new ones
+            existing_summary.update(repo_summary)
+            repo_summary = existing_summary
+        except (json.JSONDecodeError, OSError):
+            pass
+
     with open(summary_path, "w") as f:
         json.dump(repo_summary, f, indent=2)
 
-    print(f"\n  Repos processed: {processed}")
+    print(f"\n  Repos in corpus: {processed}")
+    print(f"  New clones this run: {new_clones}")
+    print(f"  Skipped (already linted): {skipped_linted}")
     print(f"  Repos with PySpark code: {repos_with_pyspark}")
     print(f"  Total PySpark files: {total_pyspark_files}")
     print(f"  Clone failures: {clone_failures}")
     print(f"  Repo summary saved to: {summary_path}")
     print(f"\nNext step:")
-    print(f"  ./scripts/pyspark-lint/run_lint.sh --repos-dir {clone_dir} --results-dir lint-results")
+    print(f"  python3 scripts/pyspark-lint/run_lint.py --repos-dir {clone_dir} --results-dir lint-results")
 
 
 if __name__ == "__main__":
