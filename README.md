@@ -202,6 +202,6 @@ Every step caches its output and skips already-processed items on re-run:
 ## Dependencies
 
 - **Python 3.9+**
-- **[cy](https://clusteryield.com)** CLI on PATH (for linting)
+- **[cy lint](https://github.com/clusteryieldanalytics/cylint)**  (`pip install cylint`)
 - **Git** (for cloning repos)
 - **requests** (for GitHub API — `pip install requests`)

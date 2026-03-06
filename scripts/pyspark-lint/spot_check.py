@@ -8,6 +8,8 @@ Usage:
   python3 spot_check.py --results-dir lint-results --list-rules
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import random
